@@ -312,7 +312,13 @@
     <a class="nav-item" href="#tool-registry"><span class="dot"></span> ToolRegistry</a>
     <a class="nav-item" href="#mcp"><span class="dot"></span> MCP Client</a>
     <a class="nav-item" href="#skills"><span class="dot"></span> Skills</a>
+    <a class="nav-item" href="#skill-store"><span class="dot"></span> Skill Store</a>
     <a class="nav-item" href="#sandbox"><span class="dot"></span> Sandbox</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-label">Security</div>
+    <a class="nav-item" href="#security"><span class="dot"></span> Secret Provider</a>
+    <a class="nav-item" href="#secret-scanner"><span class="dot"></span> Secret Scanner</a>
   </div>
   <div class="nav-group">
     <div class="nav-group-label">Orchestration</div>
@@ -362,14 +368,14 @@
 
       <div class="grid-3" style="margin-top:24px">
         <div class="stat-card">
-          <div class="num">45+</div>
+          <div class="num">55+</div>
           <div class="label">Python modules</div>
-          <div class="sub">Core, Memory, Observability, Tools, Orchestration</div>
+          <div class="sub">Core, Memory, Observability, Tools, Security, Orchestration</div>
         </div>
         <div class="stat-card">
-          <div class="num">5</div>
-          <div class="label">Memory tiers</div>
-          <div class="sub">Hot window, pages, vector, graph, short-term</div>
+          <div class="num">990</div>
+          <div class="label">Unit tests passing</div>
+          <div class="sub">0 failures — security, sandbox, skill store, checkpoints</div>
         </div>
         <div class="stat-card">
           <div class="num">8</div>
@@ -382,7 +388,7 @@
       <div class="grid-2">
         <div class="card">
           <h3 style="margin-top:0;color:var(--accent-5)">Run lifecycle</h3>
-          <p>Create → execute → checkpoint → resume → emit SSE events → stream to client. Every run is tracked in Redis with full state including HITL pauses and budget enforcement.</p>
+          <p>Create → execute → checkpoint → resume → emit SSE events → stream to client. Full history checkpointed on every exit — crash, cancel, budget, or success.</p>
         </div>
         <div class="card">
           <h3 style="margin-top:0;color:var(--accent-2)">Context engineering</h3>
@@ -395,6 +401,14 @@
         <div class="card">
           <h3 style="margin-top:0;color:var(--warn)">Self-improvement</h3>
           <p>Hermes loop: collect failures → LLM generates patch → eval on replay → auto-apply + regression rollback. Online monitor tracks per-version metrics.</p>
+        </div>
+        <div class="card">
+          <h3 style="margin-top:0;color:var(--accent-3)">Secret vault</h3>
+          <p><code>SecretProvider</code> abstraction — swap <code>EnvSecretProvider</code> (zero migration) for HashiCorp Vault or AWS Secrets Manager at startup. TTL cache. Per-tenant path isolation. <code>SecretScanner</code> redacts leaked keys before they touch history or checkpoints.</p>
+        </div>
+        <div class="card">
+          <h3 style="margin-top:0;color:var(--accent-4)">Skill store</h3>
+          <p>Vector-indexed library of reusable code, approaches, and patterns. Agents retrieve relevant skills and inject them as context instead of regenerating. Auto-captured from high-scoring runs. Dependency validation with red-flag dashboard.</p>
         </div>
       </div>
     </section>
@@ -590,6 +604,9 @@ make api</code><span class="code-lang">bash</span></pre>
           <tr><td><code>HERMES_INTERVAL_SECONDS</code></td><td><code>3600</code></td><td>How often Hermes cycle runs (seconds)</td></tr>
           <tr><td><code>HERMES_MIN_ERRORS_TO_TRIGGER</code></td><td><code>5</code></td><td>Min failures before Hermes generates a patch</td></tr>
           <tr><td><code>HERMES_PATCH_SCORE_THRESHOLD</code></td><td><code>0.7</code></td><td>Min eval score to apply a patch (0–1)</td></tr>
+          <tr><td><code>SANDBOX_WORKLOAD</code></td><td><code>general</code></td><td>Container memory: <code>general</code>=256m | <code>data</code>=512m | <code>ml</code>=2g</td></tr>
+          <tr><td><code>SANDBOX_RUNTIME</code></td><td><code>runc</code></td><td>Container runtime: <code>runc</code> | <code>runsc</code> (gVisor) | <code>kata</code></td></tr>
+          <tr><td><code>SANDBOX_SESSION_REUSE</code></td><td><code>false</code></td><td>Reuse one container per run (zero cold-start)</td></tr>
           <tr><td><code>JWT_SECRET_KEY</code></td><td>—</td><td>JWT signing secret for API auth</td></tr>
           <tr><td><code>ENVIRONMENT</code></td><td><code>dev</code></td><td><code>dev</code> | <code>staging</code> | <code>prod</code></td></tr>
           <tr><td><code>WORKSPACE_BASE_PATH</code></td><td><code>/workspaces</code></td><td>Base path for agent workspaces</td></tr>
@@ -1186,21 +1203,232 @@ analytics_skills = registry.list_for_tags(["analytics"])</code><span class="code
 
     <section class="section" id="sandbox">
       <h2>Execution Sandbox</h2>
-      <p><code>harness/filesystem/sandbox.py</code> — Isolated code execution. Docker is the primary sandbox; RestrictedPython is the fallback.</p>
+      <p><code>harness/filesystem/sandbox.py</code> — Isolated code execution. Two classes: <code>DockerSandbox</code> (one container per call) and <code>SessionDockerSandbox</code> (one container per run, zero cold-start). <code>RestrictedPython</code> is the fallback when Docker is unavailable.</p>
 
       <h3>DockerSandbox security controls</h3>
       <table>
-        <thead><tr><th>Control</th><th>Setting</th><th>Effect</th></tr></thead>
+        <thead><tr><th>Control</th><th>Default</th><th>Effect</th></tr></thead>
         <tbody>
-          <tr><td>Memory limit</td><td>256 MiB</td><td>OOM kill if exceeded</td></tr>
+          <tr><td>Memory limit</td><td>256 MiB (workload-dependent)</td><td>OOM kill if exceeded — exit code 137 surfaces as clear error</td></tr>
           <tr><td>CPU limit</td><td>1 core</td><td>No runaway CPU consumption</td></tr>
-          <tr><td>Network</td><td>Disabled by default</td><td>No outbound connections</td></tr>
+          <tr><td>Network</td><td>Disabled (<code>--network=none</code>)</td><td>No outbound connections</td></tr>
           <tr><td>User</td><td>nobody</td><td>Non-root execution</td></tr>
           <tr><td>Privileges</td><td>--no-new-privileges</td><td>Cannot escalate</td></tr>
           <tr><td>Timeout</td><td>30 s</td><td>Terminated if exceeded</td></tr>
           <tr><td>Filesystem</td><td>Workspace mount only</td><td>Cannot access host filesystem</td></tr>
+          <tr><td>Runtime</td><td><code>runc</code> (default)</td><td><code>runsc</code> = gVisor kernel isolation; <code>kata</code> = VM</td></tr>
         </tbody>
       </table>
+
+      <h3>Workload profiles</h3>
+      <p>Set <code>SANDBOX_WORKLOAD</code> in <code>.env</code> to match the memory needs of your workload.</p>
+      <table>
+        <thead><tr><th>Profile</th><th>Memory</th><th>Use case</th></tr></thead>
+        <tbody>
+          <tr><td><code>general</code></td><td>256 MiB</td><td>Scripting, algorithms, stdlib only (default)</td></tr>
+          <tr><td><code>data</code></td><td>512 MiB</td><td>pandas / numpy with real datasets</td></tr>
+          <tr><td><code>ml</code></td><td>2 GiB</td><td>torch / sklearn model runs</td></tr>
+        </tbody>
+      </table>
+
+      <h3>OOM detection</h3>
+      <p>Docker OOM-kills containers with exit code 137. All three execution paths (session, per-call Docker, subprocess fallback) detect this and return a clear <code>ToolResult(error="OOM: container exceeded memory limit")</code> instead of a silent failure. The <code>SandboxResult.oom_killed</code> property is <code>True</code> only when <code>exit_code == 137</code> and not timed out — timeout kills also exit 137 but are a distinct case.</p>
+
+      <h3>SessionDockerSandbox — zero cold-start</h3>
+      <p>Every <code>docker run</code> costs 2–5 seconds of cold-start overhead. <code>SessionDockerSandbox</code> starts one container per run and uses <code>docker exec</code> for each <code>run_code</code> call. State (variables, pip-installed packages, written files) persists across all calls within the session.</p>
+      <pre><code class="lang-python"># Enable session reuse for a run
+ctx.metadata["sandbox_session"] = True   # per-run flag
+# or globally: SANDBOX_SESSION_REUSE=true in .env
+
+# SessionDockerSandbox lifecycle (BaseAgent manages automatically)
+async with SessionDockerSandbox(workspace_path, memory_limit="512m") as sb:
+    r1 = await sb.run_code("import pandas as pd; df = pd.read_csv('data.csv')")
+    r2 = await sb.run_code("print(df.shape)")  # df is still in scope</code><span class="code-lang">python</span></pre>
+      <div class="callout warn">
+        <div class="callout-icon">⚠</div>
+        <p>If the container is OOM-killed between calls, the next <code>run_code</code> raises <code>SandboxError("Session container died")</code> and sets <code>is_alive = False</code>. The agent receives a clear error and can report or retry.</p>
+      </div>
+
+      <h3>gVisor / Kata Containers</h3>
+      <p>Set <code>SANDBOX_RUNTIME=runsc</code> to use gVisor (syscall-level kernel isolation) or <code>kata</code> for Kata Containers (full VM). Requires the runtime to be installed on the Docker host. Falls back to runc if the runtime is unavailable.</p>
+      <pre><code class="lang-bash">SANDBOX_RUNTIME=runsc    # gVisor — intercepts all syscalls, stronger isolation
+SANDBOX_RUNTIME=kata     # Kata Containers — full lightweight VM per sandbox</code><span class="code-lang">bash</span></pre>
+    </section>
+
+    <!-- ══════════════════════ SKILL STORE ══════════════════════ -->
+    <section class="section" id="skill-store">
+      <h2>Skill Store</h2>
+      <p><code>harness/tools/skill_store.py</code> — Vector-indexed library of reusable artifacts. Agents retrieve relevant skills (code snippets, architectural approaches, monitoring patterns, full codebase patterns) and inject them as context instead of regenerating common work from scratch.</p>
+
+      <h3>Skill types</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+        <span class="tag green">code</span>
+        <span class="tag blue">approach</span>
+        <span class="tag purple">codebase</span>
+        <span class="tag yellow">monitoring</span>
+      </div>
+
+      <h3>SkillArtifact</h3>
+      <p>The core data model. Every skill has a <code>requirements</code> dict (<code>{"pandas": "&gt;=2.0"}</code>) that is validated against the live environment on <code>update_validation()</code>. Mismatches force the skill to <code>BROKEN</code> status.</p>
+      <pre><code class="lang-python">from harness.tools.skill_store import SkillStore, SkillArtifact, SkillType
+
+store = SkillStore(redis=redis_client, memory_manager=memory)
+
+skill = SkillArtifact(
+    skill_id="batch-insert-001",
+    tenant_id="acme",
+    skill_type=SkillType.CODE,
+    title="Batch insert helper",
+    description="Inserts rows in 1000-row batches to avoid memory pressure",
+    content="def batch_insert(rows, conn):\n    for i in range(0, len(rows), 1000):\n        conn.executemany(sql, rows[i:i+1000])",
+    language="python",
+    requirements={"psycopg2": ">=2.9"},
+    score=0.9,
+)
+await store.save(skill)</code><span class="code-lang">python</span></pre>
+
+      <h3>Retrieval</h3>
+      <p>Vector search first (via <code>MemoryManager.recall()</code>), falls back to relevance-sorted Redis index. Broken skills are excluded by default. Results are injected as a <code>[Relevant skills from library]</code> block in the agent's first user message.</p>
+      <pre><code class="lang-python"># Wire into agent run — auto-retrieval happens each loop iteration
+ctx.metadata["skill_store"] = store
+
+# Manual retrieval
+skills = await store.retrieve_relevant(
+    query="batch insert postgres",
+    tenant_id="acme",
+    k=3,
+    skill_types=[SkillType.CODE],
+    min_score=0.5,
+)</code><span class="code-lang">python</span></pre>
+
+      <h3>SkillCapture — auto-save from successful runs</h3>
+      <p>Two gates before a skill is saved automatically: <strong>quality</strong> (<code>score ≥ min_score</code>) and <strong>novelty</strong> (cosine similarity to nearest existing skill &lt; threshold). If the vector store is unavailable, the novelty gate fails open — the skill is saved.</p>
+      <pre><code class="lang-python">from harness.tools.skill_store import SkillCapture
+
+capture = SkillCapture(store, min_score=0.8, novelty_threshold=0.9)
+saved = await capture.capture(
+    title="Cursor-based pagination",
+    description="Use WHERE id > last_seen_id instead of OFFSET",
+    content="Always use cursor pagination...",
+    skill_type=SkillType.APPROACH,
+    tenant_id="acme",
+    score=0.92,
+    run_id=ctx.run_id,
+)</code><span class="code-lang">python</span></pre>
+
+      <h3>Health report &amp; red flags</h3>
+      <table>
+        <thead><tr><th>Flag</th><th>Severity</th><th>Trigger</th></tr></thead>
+        <tbody>
+          <tr><td><code>BROKEN</code></td><td><span class="tag red">high</span></td><td>Validation failed or requirement mismatch detected</td></tr>
+          <tr><td><code>STALE</code></td><td><span class="tag yellow">medium</span></td><td>Not validated in &gt;30 days</td></tr>
+          <tr><td><code>LOW_QUALITY_HIGH_USE</code></td><td><span class="tag yellow">medium</span></td><td><code>use_count &gt; 5</code> and <code>score &lt; 0.3</code></td></tr>
+          <tr><td><code>REQUIREMENT_MISMATCH</code></td><td><span class="tag red">high</span></td><td>Known incompatible requirement stored in metadata</td></tr>
+        </tbody>
+      </table>
+      <pre><code class="lang-python">report = await store.health_report(tenant_id="acme")
+print(f"{report.total_skills} skills, {report.broken} broken")
+for flag in report.red_flags:
+    print(f"  [{flag.severity}] {flag.title}: {flag.detail}")
+
+# Validate against live environment
+await store.update_validation(
+    skill_id="batch-insert-001",
+    status=ValidationStatus.VALID,
+    env_requirements={"psycopg2": "2.9.6"},
+)</code><span class="code-lang">python</span></pre>
+    </section>
+
+    <!-- ══════════════════════ SECURITY ══════════════════════ -->
+    <section class="section" id="security">
+      <h2>Secret Provider</h2>
+      <p><code>harness/security/secrets.py</code> — Abstraction layer that keeps real credentials out of <code>AgentContext</code>, traces, checkpoints, and logs. Swap backends at startup without changing any callsite.</p>
+
+      <div class="callout warn">
+        <div class="callout-icon">⚠</div>
+        <p><strong>.env is development only.</strong> <code>EnvSecretProvider</code> reads from <code>os.environ</code> — acceptable for local dev, not for production multi-tenant deployments where different tenants should hold different keys.</p>
+      </div>
+
+      <h3>Providers</h3>
+      <table>
+        <thead><tr><th>Provider</th><th>Backend</th><th>When to use</th></tr></thead>
+        <tbody>
+          <tr><td><code>EnvSecretProvider</code></td><td><code>os.environ</code> / <code>.env</code></td><td>Local dev — zero infrastructure, zero migration</td></tr>
+          <tr><td><code>VaultSecretProvider</code></td><td>HashiCorp Vault KV v2</td><td>Production — requires <code>pip install hvac</code></td></tr>
+          <tr><td><code>AWSSecretsProvider</code></td><td>AWS Secrets Manager</td><td>AWS-hosted deployments — requires <code>pip install boto3</code></td></tr>
+          <tr><td><code>CachedSecretProvider</code></td><td>In-memory TTL cache (default 5 min)</td><td>Wrap any provider to avoid repeated vault round-trips</td></tr>
+          <tr><td><code>TenantSecretProvider</code></td><td>Path-prefix wrapper</td><td>Per-tenant isolation: tries <code>{tenant_id}/{name}</code> first, falls back to global</td></tr>
+        </tbody>
+      </table>
+
+      <pre><code class="lang-python">from harness.security import configure, VaultSecretProvider, CachedSecretProvider, get_secret
+
+# Configure once at application startup
+configure(CachedSecretProvider(
+    VaultSecretProvider(url="https://vault:8200", token=os.environ["VAULT_TOKEN"]),
+    ttl_seconds=300,
+))
+
+# Use anywhere — no import changes needed at callsites
+key = await get_secret("anthropic_api_key")
+
+# Per-tenant isolation
+from harness.security import TenantSecretProvider, EnvSecretProvider
+provider = TenantSecretProvider(EnvSecretProvider(), tenant_id="acme")
+key = await provider.get("anthropic_api_key")
+# → tries ACME/anthropic_api_key first, falls back to ANTHROPIC_API_KEY</code><span class="code-lang">python</span></pre>
+
+      <h3>Safe logging</h3>
+      <pre><code class="lang-python">from harness.security import mask, is_likely_secret
+
+# mask() for safe logging — never log raw keys
+logger.info("Using key: %s", mask(api_key))  # → "sk-ant-ap[MASKED]xyz4"
+
+# is_likely_secret() — heuristic detection
+is_likely_secret("sk-ant-api03-abc...")  # True
+is_likely_secret("hello world")          # False</code><span class="code-lang">python</span></pre>
+    </section>
+
+    <section class="section" id="secret-scanner">
+      <h2>Secret Scanner</h2>
+      <p><code>harness/security/scanner.py</code> — Detect and redact leaked API keys in any string or dict. Called by <code>_HardConstraintPipeline.check_output()</code> and by <code>BaseAgent</code> before LLM responses enter conversation history.</p>
+
+      <h3>Detected patterns</h3>
+      <table>
+        <thead><tr><th>Pattern</th><th>Example match</th><th>Replacement</th></tr></thead>
+        <tbody>
+          <tr><td>Anthropic</td><td><code>sk-ant-api03-…</code></td><td><code>[ANTHROPIC_KEY REDACTED]</code></td></tr>
+          <tr><td>OpenAI</td><td><code>sk-…</code> (32+ chars)</td><td><code>[OPENAI_KEY REDACTED]</code></td></tr>
+          <tr><td>GitHub PAT</td><td><code>ghp_…</code> / <code>github_pat_…</code></td><td><code>[GITHUB_TOKEN REDACTED]</code></td></tr>
+          <tr><td>Slack</td><td><code>xoxb-…</code> / <code>xoxp-…</code></td><td><code>[SLACK_TOKEN REDACTED]</code></td></tr>
+          <tr><td>GitLab</td><td><code>glpat-…</code></td><td><code>[GITLAB_PAT REDACTED]</code></td></tr>
+          <tr><td>JWT</td><td><code>eyJ…</code></td><td><code>[JWT REDACTED]</code></td></tr>
+          <tr><td>Bearer token</td><td><code>Bearer abc123…</code></td><td><code>Bearer [TOKEN REDACTED]</code></td></tr>
+          <tr><td>URL credentials</td><td><code>://user:pass@…</code></td><td><code>://[CREDENTIALS REDACTED]@</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code class="lang-python">from harness.security import SecretScanner, redact, scan, has_secrets
+
+scanner = SecretScanner()
+
+# Redact in a string
+safe = scanner.redact("use key sk-ant-api03-abc123xyz for auth")
+
+# Scan a nested dict (e.g. tool result, trace payload)
+matches = scanner.scan_dict({"config": {"api_key": "sk-ant-…"}})
+
+# Redact an entire dict recursively
+clean = scanner.redact_dict(tool_result_data)
+
+# Quick check
+if has_secrets(response_content):
+    logger.warning("Secret detected in LLM output")</code><span class="code-lang">python</span></pre>
+
+      <div class="callout info">
+        <div class="callout-icon">ℹ</div>
+        <p><strong>Never blocks, always redacts.</strong> The scanner returns the cleaned text and logs a warning rather than raising an exception. Blocking on a false positive would silently fail the agent run. The redacted string is safe to store in history, checkpoints, or traces.</p>
+      </div>
     </section>
 
     <!-- ══════════════════════ ORCHESTRATION ══════════════════════ -->
@@ -1537,6 +1765,12 @@ print(report.to_markdown())</code><span class="code-lang">python</span></pre>
           <tr><td><code>harness:audit</code></td><td>STREAM</td><td>—</td><td>Audit event stream</td></tr>
           <tr><td><code>harness:failures</code></td><td>STREAM</td><td>—</td><td>StepFailure stream (FailureTracker)</td></tr>
           <tr><td><code>harness:online_metrics:{agent}:{version}</code></td><td>HASH</td><td>—</td><td>VersionMetrics (OnlineLearningMonitor)</td></tr>
+          <tr><td><code>harness:skill:{skill_id}</code></td><td>HASH</td><td>90 d</td><td>SkillArtifact JSON (SkillStore)</td></tr>
+          <tr><td><code>harness:skill_index:{tenant_id}</code></td><td>ZSET</td><td>—</td><td>Skill IDs sorted by relevance score × log(use_count+1)</td></tr>
+          <tr><td><code>harness:skill_flags:{tenant_id}</code></td><td>SET</td><td>—</td><td>Skill IDs with active red flags</td></tr>
+          <tr><td><code>harness:policy:{tenant_id}</code></td><td>STRING</td><td>30 d</td><td>HarnessPolicy JSON (PolicyStore)</td></tr>
+          <tr><td><code>harness:hitl:{request_id}</code></td><td>STRING</td><td>2 h</td><td>ApprovalRequest JSON (HITLManager)</td></tr>
+          <tr><td><code>harness:hitl:pending</code></td><td>SET</td><td>—</td><td>Pending approval request IDs</td></tr>
         </tbody>
       </table>
     </section>
@@ -1566,6 +1800,8 @@ print(report.to_markdown())</code><span class="code-lang">python</span></pre>
           <tr><td><code>[sql]</code></td><td>asyncpg, sqlglot</td><td>PostgreSQL async driver + SQL parsing</td></tr>
           <tr><td><code>[ingestion]</code></td><td>pymupdf, trafilatura, python-docx</td><td>PDF/HTML/DOCX document ingestion</td></tr>
           <tr><td><code>[structured]</code></td><td>instructor</td><td>Structured LLM output (Pydantic models)</td></tr>
+          <tr><td><code>[vault]</code></td><td>hvac</td><td>HashiCorp Vault secret provider</td></tr>
+          <tr><td><code>[aws]</code></td><td>boto3</td><td>AWS Secrets Manager secret provider</td></tr>
           <tr><td><code>[all]</code></td><td>All of the above</td><td>Full production stack</td></tr>
         </tbody>
       </table>
@@ -1577,7 +1813,7 @@ print(report.to_markdown())</code><span class="code-lang">python</span></pre>
     </section>
 
     <div style="margin-top:64px;padding-top:32px;border-top:1px solid var(--border);color:var(--muted);font-size:12px">
-      HarnessAgent Technical Documentation &bull; v0.1.0 &bull; Built 2026
+      HarnessAgent Technical Documentation &bull; v0.2.0 &bull; Updated May 2026 &bull; 990 tests passing
     </div>
   </div>
 </div>
