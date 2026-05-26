@@ -324,8 +324,13 @@
     <div class="nav-group-label">Orchestration</div>
     <a class="nav-item" href="#runner"><span class="dot"></span> AgentRunner</a>
     <a class="nav-item" href="#planner"><span class="dot"></span> Planner & Scheduler</a>
+    <a class="nav-item" href="#blackboard"><span class="dot"></span> Agent Blackboard</a>
     <a class="nav-item" href="#hitl"><span class="dot"></span> HITL</a>
     <a class="nav-item" href="#messaging"><span class="dot"></span> Messaging Bus</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-label">Verification</div>
+    <a class="nav-item" href="#pev-verifier"><span class="dot"></span> PEV Verifier</a>
   </div>
   <div class="nav-group">
     <div class="nav-group-label">LLM Layer</div>
@@ -335,6 +340,7 @@
     <div class="nav-group-label">Self-Improvement</div>
     <a class="nav-item" href="#hermes"><span class="dot"></span> Hermes Loop</a>
     <a class="nav-item" href="#eval"><span class="dot"></span> Eval Framework</a>
+    <a class="nav-item" href="#attribution"><span class="dot"></span> Failure Attribution</a>
   </div>
   <div class="nav-group">
     <div class="nav-group-label">Reference</div>
@@ -1739,6 +1745,137 @@ print(report.to_markdown())</code><span class="code-lang">python</span></pre>
 }</code><span class="code-lang">json</span></pre>
     </section>
 
+    <!-- ══════════════════════ PEV VERIFIER ══════════════════════ -->
+    <section class="section" id="pev-verifier">
+      <h2>PEV Verifier</h2>
+      <p><code>harness/verification/verifier.py</code> — The missing third leg of the agent control loop. Without a verifier, agents terminate on <em>implicit convergence</em> — when they stop requesting tool calls — not when their output is objectively correct.</p>
+
+      <div class="arch-box" style="margin-bottom:16px">
+        <div class="arch-label">Plan → Execute → <strong>Verify</strong> → (feedback injected) → done</div>
+        <div class="arch-items">
+          <span class="arch-chip blue">Plan</span>
+          <span class="arch-chip blue">Execute</span>
+          <span class="arch-chip green">Verify ← new</span>
+        </div>
+      </div>
+
+      <h3>Verifier protocol</h3>
+      <pre><code class="lang-python">from harness.verification import CodeExitCodeVerifier, NoopVerifier, ExpectedOutputVerifier
+
+# Wire into agent run — zero overhead, checks exit code from last run_python call
+ctx.metadata["verifier"] = CodeExitCodeVerifier()
+
+# Known-answer verifier for evals
+ctx.metadata["verifier"] = ExpectedOutputVerifier(expected="42", exact=True)
+
+# No-op when you have no objective oracle
+ctx.metadata["verifier"] = NoopVerifier()</code><span class="code-lang">python</span></pre>
+
+      <h3>How it works</h3>
+      <p>After each no-tool-call LLM response, <code>BaseAgent._verify_output()</code> calls the verifier. If it fails, the feedback is injected as a user message and the loop continues — up to <code>_MAX_VERIFICATION_ATTEMPTS = 3</code>. The verifier never crashes a run: exceptions fail-open (treated as skipped).</p>
+
+      <h3>CodeExitCodeVerifier failure triggers</h3>
+      <table>
+        <thead><tr><th>Condition</th><th>Feedback injected</th></tr></thead>
+        <tbody>
+          <tr><td>exit_code ≠ 0</td><td>stderr snippet + "Fix the error above"</td></tr>
+          <tr><td>exit_code = 137 (OOM)</td><td>"OOM: container exceeded memory limit"</td></tr>
+          <tr><td>timed_out = True</td><td>"Code timed out — optimize or reduce scope"</td></tr>
+          <tr><td>exit 0 but stderr has Traceback</td><td>Exception snippet + fix prompt</td></tr>
+          <tr><td>No <code>last_code_result</code> in metadata</td><td>Skipped (passes)</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ══════════════════════ BLACKBOARD ══════════════════════ -->
+    <section class="section" id="blackboard">
+      <h2>Agent Blackboard</h2>
+      <p><code>harness/orchestrator/blackboard.py</code> — Per-plan Redis-backed shared artifact store. Instead of receiving only text summaries of predecessor outputs, downstream agents can query the exact typed artifact they need.</p>
+
+      <div class="callout info">
+        <div class="callout-icon">ℹ</div>
+        <p><strong>Paper gap closed (§4.3).</strong> The paper identifies implicit text-only handoffs as the root cause of multi-agent brittleness. AgentBlackboard provides the "formal, persistent shared substrate" that makes coordination reliable.</p>
+      </div>
+
+      <h3>Artifact types</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+        <span class="tag green">output</span>
+        <span class="tag blue">code</span>
+        <span class="tag blue">sql</span>
+        <span class="tag blue">test_result</span>
+        <span class="tag blue">file_list</span>
+        <span class="tag purple">analysis</span>
+        <span class="tag yellow">error</span>
+      </div>
+
+      <pre><code class="lang-python">from harness.orchestrator import AgentBlackboard
+
+# Scheduler creates one blackboard per plan when redis= is provided
+scheduler = Scheduler(agent_runner=runner, redis=redis_client)
+
+# Agents publish typed artifacts via result metadata
+result.metadata["blackboard_sql"]         = "SELECT COUNT(*) FROM orders"
+result.metadata["blackboard_test_result"] = "passed: 42 rows"
+
+# Direct API
+bb = AgentBlackboard(redis_client, plan_id="plan-123")
+await bb.write("sql_agent", "sql", "SELECT * FROM users")
+entry = await bb.get("sql_agent", "sql")
+
+# Downstream agent reads predecessor artifacts
+context = await bb.format_for_context(subtask_ids=["sql_agent"])
+# → "[Shared plan artifacts]\n--- sql_agent / sql ---\nSELECT * FROM users"
+
+# Query by type
+sql_entries = await bb.read(artifact_types=["sql", "test_result"])</code><span class="code-lang">python</span></pre>
+
+      <h3>Scheduler integration</h3>
+      <p>When <code>redis=</code> is provided to <code>Scheduler</code>, each subtask's task description is automatically prefixed with a <code>[Shared plan artifacts]</code> block containing all predecessor artifacts. Backward compatible — omit <code>redis=</code> for the existing text-only handoff.</p>
+    </section>
+
+    <!-- ══════════════════════ FAILURE ATTRIBUTION ══════════════════════ -->
+    <section class="section" id="attribution">
+      <h2>Failure Attribution</h2>
+      <p><code>harness/eval/failure_taxonomy.py</code> — Maps <code>AgentResult.failure_class</code> to the harness layer that caused the failure. Separates <em>content</em> failures (wrong SQL, hallucination) from <em>infrastructure</em> failures (tool timeout, budget exceeded).</p>
+
+      <h3>HarnessComponent</h3>
+      <table>
+        <thead><tr><th>Component</th><th>failure_class values</th><th>What to tune</th></tr></thead>
+        <tbody>
+          <tr><td><code>tool</code></td><td>TOOL_TIMEOUT, TOOL_EXEC_ERROR, TOOL_NOT_FOUND</td><td>Increase timeout, fix tool schema</td></tr>
+          <tr><td><code>safety</code></td><td>SAFETY_STEP, SAFETY_INPUT, SAFETY_OUTPUT</td><td>Refine policy, adjust guardrails</td></tr>
+          <tr><td><code>budget</code></td><td>BUDGET_STEPS, BUDGET_TOKENS, BUDGET_TIME</td><td>Increase limits, simplify task</td></tr>
+          <tr><td><code>llm</code></td><td>LLM_RATE_LIMIT, LLM_TIMEOUT, LLM_ERROR</td><td>Add retry, switch provider</td></tr>
+          <tr><td><code>hitl</code></td><td>INTER_AGENT_REJECT</td><td>Review HITL policy, reduce risky calls</td></tr>
+        </tbody>
+      </table>
+
+      <pre><code class="lang-python">from harness.eval.failure_taxonomy import attribute_to_component, HarnessComponent
+from harness.eval.agent_scorer import AgentScores
+
+# Pass failure_class through from AgentResult
+scores = AgentScores(..., harness_failure_class=result.failure_class)
+
+# EvalReport.component_attribution() counts failures per layer
+report = AgentEvalReport("my-eval", scores_list)
+attr = report.component_attribution()
+# → {"tool": 6, "budget": 3, "safety": 1}
+
+# In markdown report — Harness Component Attribution table is auto-included</code><span class="code-lang">python</span></pre>
+
+      <h3>Extended Hermes patches</h3>
+      <p><code>PatchGenerator</code> now generates patches beyond prompts based on failure class:</p>
+      <table>
+        <thead><tr><th>Method</th><th>Triggered by</th><th>Patch target</th></tr></thead>
+        <tbody>
+          <tr><td><code>generate()</code></td><td>Any failure</td><td><code>prompt</code> — rewrites system prompt</td></tr>
+          <tr><td><code>generate_tool_patch()</code></td><td>TOOL_* failures</td><td><code>tool_config</code> — updates tool description/schema</td></tr>
+          <tr><td><code>generate_retry_patch()</code></td><td>TOOL_TIMEOUT</td><td><code>retry_config</code> — doubles <code>timeout_seconds</code> (max 120s)</td></tr>
+          <tr><td><code>generate_permission_patch()</code></td><td>SAFETY_* failures</td><td><code>permission</code> — adds blocked tool to HarnessPolicy</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <!-- ══════════════════════ REDIS SCHEMA ══════════════════════ -->
     <section class="section" id="redis-schema">
       <h2>Redis Schema</h2>
@@ -1771,6 +1908,8 @@ print(report.to_markdown())</code><span class="code-lang">python</span></pre>
           <tr><td><code>harness:policy:{tenant_id}</code></td><td>STRING</td><td>30 d</td><td>HarnessPolicy JSON (PolicyStore)</td></tr>
           <tr><td><code>harness:hitl:{request_id}</code></td><td>STRING</td><td>2 h</td><td>ApprovalRequest JSON (HITLManager)</td></tr>
           <tr><td><code>harness:hitl:pending</code></td><td>SET</td><td>—</td><td>Pending approval request IDs</td></tr>
+          <tr><td><code>harness:blackboard:{plan_id}:{type}:{subtask_id}</code></td><td>STRING</td><td>24 h</td><td>BlackboardEntry JSON (AgentBlackboard)</td></tr>
+          <tr><td><code>harness:blackboard:{plan_id}:index</code></td><td>ZSET</td><td>24 h</td><td>Artifact keys scored by write timestamp</td></tr>
         </tbody>
       </table>
     </section>
@@ -1779,41 +1918,43 @@ print(report.to_markdown())</code><span class="code-lang">python</span></pre>
     <section class="section" id="dependencies">
       <h2>Dependencies</h2>
 
-      <h3>Core (always installed)</h3>
+      <h3>Core — v0.3.1 (~50 MB, no torch)</h3>
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px">
-        <span class="tag">fastapi ≥0.115</span><span class="tag">pydantic ≥2.9</span>
-        <span class="tag">redis ≥5.2</span><span class="tag">anthropic ≥0.40</span>
-        <span class="tag">openai ≥1.50</span><span class="tag">httpx ≥0.28</span>
-        <span class="tag">networkx ≥3.3</span><span class="tag">sqlalchemy ≥2.0</span>
-        <span class="tag">uvicorn</span><span class="tag">rq ≥2.0</span>
-        <span class="tag">apscheduler ≥3.10</span><span class="tag">sse-starlette ≥2.1</span>
+        <span class="tag">pydantic ≥2.9</span><span class="tag">pydantic-settings ≥2.6</span>
+        <span class="tag">redis ≥5.2</span><span class="tag">httpx ≥0.28</span>
+        <span class="tag">networkx ≥3.3</span><span class="tag">jsonschema ≥4.23</span>
+        <span class="tag">structlog ≥24.4</span><span class="tag">aiofiles ≥24.1</span>
       </div>
 
-      <h3>Optional extras</h3>
+      <h3>Optional extras — pick what you need</h3>
       <table>
-        <thead><tr><th>Extra</th><th>Packages</th><th>Enables</th></tr></thead>
+        <thead><tr><th>Extra</th><th>Packages</th><th>Install size</th><th>Enables</th></tr></thead>
         <tbody>
-          <tr><td><code>[vector]</code></td><td>chromadb, qdrant-client, weaviate-client, sentence-transformers</td><td>Vector memory backends + embeddings</td></tr>
-          <tr><td><code>[graph]</code></td><td>neo4j</td><td>Neo4j production graph backend</td></tr>
-          <tr><td><code>[observe]</code></td><td>mlflow, opentelemetry-sdk, opentelemetry-exporter-otlp, prometheus-client</td><td>MLflow tracking, OTel export, Prometheus metrics</td></tr>
-          <tr><td><code>[mcp]</code></td><td>mcp ≥1.2</td><td>MCP server connections</td></tr>
-          <tr><td><code>[sql]</code></td><td>asyncpg, sqlglot</td><td>PostgreSQL async driver + SQL parsing</td></tr>
-          <tr><td><code>[ingestion]</code></td><td>pymupdf, trafilatura, python-docx</td><td>PDF/HTML/DOCX document ingestion</td></tr>
-          <tr><td><code>[structured]</code></td><td>instructor</td><td>Structured LLM output (Pydantic models)</td></tr>
-          <tr><td><code>[vault]</code></td><td>hvac</td><td>HashiCorp Vault secret provider</td></tr>
-          <tr><td><code>[aws]</code></td><td>boto3</td><td>AWS Secrets Manager secret provider</td></tr>
-          <tr><td><code>[all]</code></td><td>All of the above</td><td>Full production stack</td></tr>
+          <tr><td><code>[anthropic]</code></td><td>anthropic ≥0.40</td><td>~15 MB</td><td>Claude provider (lazy-loaded)</td></tr>
+          <tr><td><code>[openai]</code></td><td>openai ≥1.50, tiktoken</td><td>~20 MB</td><td>GPT / o-series provider (lazy-loaded)</td></tr>
+          <tr><td><code>[api]</code></td><td>fastapi, uvicorn, sse-starlette, python-jose, passlib</td><td>~30 MB</td><td>REST API server + auth</td></tr>
+          <tr><td><code>[workers]</code></td><td>apscheduler, rq</td><td>~10 MB</td><td>Background workers + Hermes scheduler</td></tr>
+          <tr><td><code>[sql]</code></td><td>sqlalchemy, aiosqlite, asyncpg, sqlglot</td><td>~20 MB</td><td>SQL agent, run store, async PostgreSQL</td></tr>
+          <tr><td><code>[vector]</code></td><td>fastembed, chromadb, qdrant-client, weaviate-client</td><td>~200 MB</td><td>Vector memory + <strong>ONNX embeddings (no torch)</strong></td></tr>
+          <tr><td><code>[embed-full]</code></td><td>sentence-transformers</td><td>~1.5 GB</td><td>PyTorch-based embeddings — explicit opt-in</td></tr>
+          <tr><td><code>[graph]</code></td><td>neo4j</td><td>~5 MB</td><td>Neo4j production graph backend</td></tr>
+          <tr><td><code>[observe]</code></td><td>mlflow, opentelemetry-sdk, prometheus-client</td><td>~200 MB</td><td>MLflow, OTel, Prometheus</td></tr>
+          <tr><td><code>[mcp]</code></td><td>mcp ≥1.2</td><td>~5 MB</td><td>MCP server connections</td></tr>
+          <tr><td><code>[vault]</code></td><td>hvac</td><td>~2 MB</td><td>HashiCorp Vault secret provider</td></tr>
+          <tr><td><code>[aws]</code></td><td>boto3</td><td>~10 MB</td><td>AWS Secrets Manager</td></tr>
+          <tr><td><code>[recommended]</code></td><td>anthropic + openai + api + workers + sql + vector</td><td>~300 MB</td><td>Good default — no torch</td></tr>
+          <tr><td><code>[all]</code></td><td>All except torch</td><td>~500 MB</td><td>Full stack without PyTorch</td></tr>
         </tbody>
       </table>
 
       <div class="callout success">
         <div class="callout-icon">✓</div>
-        <p><strong>Development setup:</strong> <code>pip install harnessagent[vector,observe,mcp]</code> covers the most common production use case. Use NetworkX (default graph backend) for local development; switch to Neo4j for production graph workloads.</p>
+        <p><strong>v0.3.1 recommendation:</strong> <code>pip install agent-haas[recommended]</code> — ~300 MB, includes Claude + GPT + REST API + vector memory (fastembed ONNX, no torch). Add <code>[embed-full]</code> only if you need sentence-transformers specifically.</p>
       </div>
     </section>
 
     <div style="margin-top:64px;padding-top:32px;border-top:1px solid var(--border);color:var(--muted);font-size:12px">
-      HarnessAgent Technical Documentation &bull; v0.2.0 &bull; Updated May 2026 &bull; 990 tests passing
+      HarnessAgent Technical Documentation &bull; v0.3.1 &bull; Updated May 2026 &bull; 1084 tests passing
     </div>
   </div>
 </div>
