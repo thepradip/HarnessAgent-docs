@@ -1322,6 +1322,19 @@ saved = await capture.capture(
     run_id=ctx.run_id,
 )</code><span class="code-lang">python</span></pre>
 
+      <h3>Auto-trigger from BaseAgent (v0.3.2)</h3>
+      <p>High-scoring runs are now captured automatically. Set these in <code>ctx.metadata</code> before the run:</p>
+      <pre><code class="lang-python">from harness.tools.skill_store import SkillCapture, SkillType
+
+# Wire once at run setup
+ctx.metadata["skill_capture"] = SkillCapture(store, min_score=0.8)
+ctx.metadata["skill_score"]   = 0.92          # from RLVR, eval scorer, or static
+ctx.metadata["skill_title"]   = "Batch insert helper"
+ctx.metadata["skill_type"]    = "code"         # code | approach | codebase | monitoring
+
+# BaseAgent.finally calls _maybe_capture_skill() automatically —
+# skill is saved if score >= min_score AND novelty gate passes</code><span class="code-lang">python</span></pre>
+
       <h3>Health report &amp; red flags</h3>
       <table>
         <thead><tr><th>Flag</th><th>Severity</th><th>Trigger</th></tr></thead>
@@ -1503,16 +1516,27 @@ plan = await planner.plan(
       <h2>Human-in-the-Loop (HITL)</h2>
       <p><code>harness/orchestrator/hitl.py</code> — Pause agent execution and wait for human approval before executing sensitive tool calls.</p>
 
-      <pre><code class="lang-python"># In agent context metadata
+      <pre><code class="lang-python"># Wire manager with optional policy learning + memory feedback (v0.3.2)
+hitl_manager = HITLManager(
+    redis=redis_client,
+    policy_store=policy_store,         # rejection → adds tool to blocked_tools
+    learn_from_rejections=True,
+    memory_manager=memory_manager,     # NEW: approval/rejection stored in memory
+)
+
 ctx.metadata["hitl_manager"] = hitl_manager
 ctx.metadata["policy"] = policy  # policy.requires_hitl(tool_name) → bool
 
-# During tool execution, BaseAgent calls:
-request = await hitl_manager.request_approval(ctx, tool_name, tool_args)
+# BaseAgent calls internally:
+request = await hitl_manager.request_approval(run_id, tenant_id, tool_name, tool_args)
 decision = await hitl_manager.await_decision(request.request_id, timeout=3600.0)
 # "approved" → continue; "rejected"/"expired" → raise HITLRejected</code><span class="code-lang">python</span></pre>
 
-      <p>Pending requests are stored in Redis sorted set <code>harness:hitl:pending</code> and exposed via <code>GET /hitl/pending</code>.</p>
+      <p>Pending requests are stored in Redis and exposed via <code>GET /hitl/pending</code>.</p>
+      <div class="callout info">
+        <div class="callout-icon">ℹ</div>
+        <p><strong>Feedback loop (v0.3.2).</strong> When <code>memory_manager</code> is provided, every approval and rejection is stored via <code>memory.remember()</code>. Future runs retrieve these as context — the agent sees "HITL rejected: tool='drop_table'" before attempting the same call again.</p>
+      </div>
     </section>
 
     <section class="section" id="messaging">
@@ -1590,12 +1614,12 @@ router.register(OpenAIProvider(api_key=cfg.openai_api_key, model="gpt-4o-mini"),
         <div class="arch-label">Hermes cycle (runs every hermes_interval_seconds)</div>
         <div style="font-size:13px;color:var(--muted);line-height:2">
           1. Check pending rollback from last auto-apply<br>
-          2. Count failures in rolling window → skip if &lt; min_errors<br>
-          3. Sample representative failures (semantic search)<br>
-          4. LLM generates prompt patch proposal<br>
-          5. Evaluator replays failing tasks with patched config → composite score<br>
-          6. If score ≥ threshold AND auto_apply: apply patch via PromptStore<br>
-          7. Schedule rollback check for next cycle<br>
+          2. Count failures → skip if &lt; min_errors<br>
+          3. <strong>Temporal split</strong>: older errors → generation; newer errors → held-out validation<br>
+          4. <strong>Route patch type</strong>: TOOL_TIMEOUT → retry patch · SAFETY_* → permission patch · TOOL_* → tool patch · other → prompt patch<br>
+          5. Evaluate patch on <em>held-out</em> set (never the generation set)<br>
+          6. <strong>Regression invariant</strong>: score must exceed threshold by ≥15% before auto-apply<br>
+          7. Apply via PromptStore; schedule rollback check<br>
           8. Log metrics to MLflow + Prometheus
         </div>
       </div>
@@ -1831,6 +1855,9 @@ sql_entries = await bb.read(artifact_types=["sql", "test_result"])</code><span c
 
       <h3>Scheduler integration</h3>
       <p>When <code>redis=</code> is provided to <code>Scheduler</code>, each subtask's task description is automatically prefixed with a <code>[Shared plan artifacts]</code> block containing all predecessor artifacts. Backward compatible — omit <code>redis=</code> for the existing text-only handoff.</p>
+
+      <h3>Conflict detection (v0.3.2)</h3>
+      <p>Two agents writing to the same <code>(subtask_id, artifact_type)</code> key use <strong>last-write-wins</strong> semantics. The previous writer's identity is logged as a warning and the <code>written_by</code> field in <code>metadata</code> is always set, providing a full audit trail of who wrote what and when.</p>
     </section>
 
     <!-- ══════════════════════ FAILURE ATTRIBUTION ══════════════════════ -->
@@ -1918,7 +1945,7 @@ attr = report.component_attribution()
     <section class="section" id="dependencies">
       <h2>Dependencies</h2>
 
-      <h3>Core — v0.3.1 (~50 MB, no torch)</h3>
+      <h3>Core — v0.3.2 (~50 MB, no torch)</h3>
       <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px">
         <span class="tag">pydantic ≥2.9</span><span class="tag">pydantic-settings ≥2.6</span>
         <span class="tag">redis ≥5.2</span><span class="tag">httpx ≥0.28</span>
@@ -1949,12 +1976,12 @@ attr = report.component_attribution()
 
       <div class="callout success">
         <div class="callout-icon">✓</div>
-        <p><strong>v0.3.1 recommendation:</strong> <code>pip install agent-haas[recommended]</code> — ~300 MB, includes Claude + GPT + REST API + vector memory (fastembed ONNX, no torch). Add <code>[embed-full]</code> only if you need sentence-transformers specifically.</p>
+        <p><strong>v0.3.2 recommendation:</strong> <code>pip install agent-haas[recommended]</code> — ~300 MB, includes Claude + GPT + REST API + vector memory (fastembed ONNX, no torch). Add <code>[embed-full]</code> only if you need sentence-transformers specifically.</p>
       </div>
     </section>
 
     <div style="margin-top:64px;padding-top:32px;border-top:1px solid var(--border);color:var(--muted);font-size:12px">
-      HarnessAgent Technical Documentation &bull; v0.3.1 &bull; Updated May 2026 &bull; 1084 tests passing
+      HarnessAgent Technical Documentation &bull; v0.3.2 &bull; Updated May 2026 &bull; 1084 tests passing
     </div>
   </div>
 </div>
